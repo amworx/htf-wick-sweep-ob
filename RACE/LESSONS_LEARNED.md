@@ -736,6 +736,66 @@ V9.3 ??? COMPLETE
 
 ---
 
+# LESSON-016
+
+## Problem
+
+Zone boxes appeared at year ~1975 on the chart instead of the correct position (2026). The `xloc.bar_time` box x1 coordinate was wrong.
+
+## Root Cause
+
+Inside `f_htfStrict()`, the confirmation bar's timestamp was captured as:
+
+```pine
+eventConfirmTime := time   // local int inside request.security()
+```
+
+This local `int` variable was returned as the 5th tuple element. When it crossed the `request.security()` context boundary back to chart scope, Pine Script **truncated the value to 1/10** of the correct epoch ms:
+
+```text
+Correct:     1,782,489,600,000  → 2026-06-26 16:00 UTC
+Truncated:     178,248,960,000  → 1975-08-26
+```
+
+The root mechanism: inside `request.security()`, the `time` built-in returns the HTF bar's epoch-ms timestamp as a full 64-bit value. Assigning it to a local `int` variable (`eventConfirmTime := time`) is fine inside the function scope. But when that local `int` is packed into a tuple and serialized back through `request.security()`, the value loses precision — only ~36 bits survive instead of the full ~41 bits needed for current epoch ms values.
+
+The **symptom** was that zone boxes (drawn with `box.new(sweepT, top, confirmT, bottom, xloc=xloc.bar_time)`) had their x1 at year ~1975 because `confirmT` (= `z.confirmTime`) had the truncated value.
+
+## Solution
+
+Avoid using local `int` variables for timestamps that must cross the `request.security()` boundary. Instead, return the bare `time` built-in as a dedicated tuple element:
+
+```pine
+// Inside f_htfStrict() return tuple — element 11 is bare `time`:
+[..., eventConfirmTime, ..., time, low, high]
+
+// Destructuring in chart scope — `time` → `currentHtfTime` (full precision):
+[..., eventConfirmTime, ..., currentHtfTime, currentHtfLow, currentHtfHigh]
+```
+
+At zone creation, use `currentHtfTime` instead of `eventConfirmTime`:
+
+```pine
+// Before (broken):
+f_createZone(eventDir, eventTop, eventBottom, eventSweepTime, eventConfirmTime, ...)
+
+// After (fixed):
+f_createZone(eventDir, eventTop, eventBottom, eventSweepTime, currentHtfTime, ...)
+```
+
+## Key Insight
+
+Local variables in Pine Script do **not** survive cross-context serialization with the same precision as built-in values. When a timestamp needs to cross `request.security()` faithfully, always return `time` directly as a tuple element — never as a local `int` that was assigned from `time`.
+
+## Status
+
+```text
+V9.3.1 — COMPLETE (zone creation confirmTime)
+eventSweepTime may have same issue — not yet confirmed/reported
+```
+
+---
+
 # Golden Lesson
 
 Whenever a new feature proposal appears, ask:

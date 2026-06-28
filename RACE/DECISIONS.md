@@ -410,3 +410,43 @@ Status:
 ```text
 V9.2.3
 ```
+
+---
+
+## DECISION-016
+
+### Use built-in `time` from tuple return, not local `int` copy, for timestamps crossing `request.security()`
+
+Decision:
+
+```text
+When a timestamp derived from time needs to survive the
+request.security() context boundary, return time as a dedicated
+tuple element rather than assigning it to a local int variable.
+```
+
+Reason:
+
+A local `int eventConfirmTime := time` inside `f_htfStrict()` produced
+a value truncated to 1/10 of the correct epoch ms after crossing the
+`request.security()` boundary (e.g., 178,248,960,000 instead of
+1,782,489,600,000). This caused zone box x1 positions at year ~1975.
+
+The built-in `time` returned directly as a tuple element (element 11)
+retained full precision. This is a Pine Script serialization behavior:
+local variables packed into the return tuple lose precision compared
+to the bare `time` built-in.
+
+Applied to: zone creation confirmTime (replaced `eventConfirmTime`
+with `currentHtfTime` = `time` from element 11).
+
+Sibling variables that may have the same issue:
+
+- `eventSweepTime` (also set from `time` via `pSweepTime`) ??? not
+  fixed yet because no `currentSweepTime` equivalent exists in scope
+
+Status:
+
+```text
+V9.3.1
+```

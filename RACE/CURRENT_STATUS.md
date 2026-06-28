@@ -144,6 +144,20 @@ STABLE
 
 ---
 
+## Timestamp Truncation Fix [V9.3.1]
+
+??? Bug identified: `eventConfirmTime` (local `int` assigned from `time`) was truncated to 1/10 of the correct epoch ms when returned through `request.security()`
+
+??? Fix: Zone creation now uses `currentHtfTime` (the built-in `time` returned as a direct tuple element from `request.security()`) which retains full precision
+
+??? Affected fields: `z.confirmTime`, `lastCreatedConfirmTime`, `lastEventTime` ??? all switch from `eventConfirmTime` to `currentHtfTime`
+
+??? Ensures correct `xloc.bar_time` box positioning (box x1 no longer appears at year 1975)
+
+??? Ensures correct `currentHtfTime > z.confirmTime` lifecycle gate comparison
+
+---
+
 # Current Development Target
 
 ```text

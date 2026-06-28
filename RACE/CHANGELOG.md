@@ -121,6 +121,40 @@ PRODUCTION READY
 
 ---
 
+# V9.3.1 ??? Timestamp Truncation Fix
+
+Fixed a bug where zone `confirmTime` was stored with 1/10 the correct epoch-ms value, causing `xloc.bar_time` boxes to appear at year ~1975.
+
+## Bug
+
+Inside `f_htfStrict()`, `eventConfirmTime := time` assigned the HTF bar's timestamp to a local `int` variable. When returned as the 5th element through `request.security()`, the value was truncated from e.g. `1,782,489,600,000` to `178,248,960,000`.
+
+This caused:
+
+- Box `x1` positioned at year ~1975 instead of the correct date (2026)
+- Label `H:` display showing the wrong epoch ms
+- `currentHtfTime > z.confirmTime` comparison (full-precision vs 1/10-precision) still worked but was semantically incorrect
+
+## Fix
+
+Replaced `eventConfirmTime` with `currentHtfTime` (the built-in `time` returned as the 11th tuple element from `request.security()`) at every consumption point in zone creation:
+
+| Field                    | Before (truncated) | After (correct)  |
+| ------------------------ | ------------------ | ---------------- |
+| `z.confirmTime`          | `eventConfirmTime` | `currentHtfTime` |
+| `lastCreatedConfirmTime` | `eventConfirmTime` | `currentHtfTime` |
+| `lastEventTime`          | `eventConfirmTime` | `currentHtfTime` |
+
+## Root Cause
+
+Pine Script truncates local `int` variables assigned from `time` when crossing the `request.security()` context boundary. The built-in `time` symbol, when packed directly into the return tuple, retains full epoch-ms precision. This is a Pine Script serialization behavior ??? not a logic error.
+
+## Files Changed
+
+- `htf_wick_sweep_ob.pine` ??? 6 lines changed in zone creation block (lines 364-377)
+
+---
+
 # V9.3 ??? ConfirmationScore
 
 Replaced the binary `nonOverlap` confirmation gate with a continuous ConfirmationScore (0-100) computed from 4 sub-scores on the confirmation candle.
@@ -136,7 +170,7 @@ Replaced the binary `nonOverlap` confirmation gate with a continuous Confirmatio
 | Component    | Weight | Measurement                                              |
 | ------------ | ------ | -------------------------------------------------------- |
 | Displacement | 40%    | Confirmation close distance past zone, normalized by ATR |
-| Rejection    | 30%    | Overlap avoidance ??? 100 = no overlap, 0 = full overlap   |
+| Rejection    | 30%    | Overlap avoidance ??? 100 = no overlap, 0 = full overlap |
 | FVG          | 20%    | Fair Value Gap between sweep and confirm candles         |
 | Efficiency   | 10%    | What % of the confirm candle range is directional        |
 
