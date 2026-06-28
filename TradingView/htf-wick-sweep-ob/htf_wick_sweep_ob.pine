@@ -1,306 +1,110 @@
-﻿//@version=6
-indicator("HTF Wick Sweep OB ??? V29 Debug+Alerts", overlay=true, max_boxes_count=500, max_labels_count=500, max_lines_count=500)
+//@version=6
+indicator("HTF Wick Sweep OB - Clean DT Core v1.6 Debug", overlay=true, max_boxes_count=500, max_labels_count=500)
 
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// V19 STRICT ROUTE
-// Detection is HTF-locked and intentionally simple:
-// 1) HTF sweep candle wicks beyond previous HTF wick liquidity.
-// 2) Same sweep candle closes back beyond the swept level.
-// 3) Draw wick-to-body zone only after the next HTF candle closes.
-// Note: Candle direction does not gate zone creation ??? a bearish candle
-// can create a bullish zone and vice versa, provided it matches the
-// sweep direction (low sweep ??? bull zone, high sweep ??? bear zone).
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+// =============================================================================
+// CLEAN REBUILD NOTES
+// =============================================================================
+// DT in this script means Deepest Touch (a price), not Date/Time.
+// Core model:
+//   c1 = liquidity candle/level source
+//   c2 = sweep candle -> creates a pending zone from c2 protruding wick range
+//   c3 = immediate next HTF candle -> decides Fresh / Mitigated / Invalid+Promote
+//   Cx = future HTF candles -> update DT only when they go deeper into the zone
+//
+// Direction is represented by one flag:
+//   DIR_BULL = bullish/support zone below price
+//   DIR_BEAR = bearish/resistance zone above price
+// =============================================================================
 
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Inputs ??? simplified for normal users
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-htfTf = input.timeframe("60", "HTF Timeframe", group="1. Core", tooltip="The higher timeframe where zones are detected. Default is 1H. Use this indicator on a lower chart timeframe, e.g. 1m/5m/15m chart with 1H HTF.")
-quality = input.string("Balanced", "Signal Quality", options=["Sensitive", "Balanced", "Strict", "Custom"], group="1. Core", tooltip="Sensitive = more zones. Balanced = recommended. Strict = fewer zones. Custom unlocks the advanced values below.")
+// -----------------------------------------------------------------------------
+// Inputs
+// -----------------------------------------------------------------------------
+htfTf = input.timeframe("60", "HTF Timeframe", group="1. Core")
+lookback = input.int(1, "Liquidity Lookback", minval=1, maxval=20, group="1. Core")
+minSweepTicks = input.int(1, "Minimum Sweep Distance (ticks)", minval=1, maxval=100, group="1. Core")
+fullBufferTicks = input.int(1, "Full Traversal Buffer (ticks)", minval=0, maxval=20, group="1. Core", tooltip="Extra ticks required beyond the far edge before c3 is considered a full invalidation.")
+minDtMoveTicks = input.int(1, "Minimum DT Move (ticks)", minval=0, maxval=50, group="1. Core", tooltip="A zone is marked mitigated only when price moves deeper than current DT by at least this many ticks.")
+dualSweepMode = input.string("Candle Direction", "Dual Sweep Resolution", options=["Candle Direction", "Larger Sweep"], group="1. Core", tooltip="When the same HTF candle sweeps both high and low liquidity, choose direction by candle body direction or by larger sweep distance.")
 
-customLookback = input.int(1, "Advanced: Liquidity Lookback", minval=1, maxval=20, group="2. Advanced", tooltip="Custom mode only. The sweep candle must take the highest high/lowest low of the previous N HTF candles. 1 = previous candle liquidity.")
-customMinBodyPct = input.float(35.0, "Advanced: Min Sweep Body %", minval=0.0, maxval=90.0, step=5.0, group="2. Advanced", tooltip="Custom mode only. Minimum body size of the sweep candle as a percentage of the candle range. Helps require displacement.") / 100.0
-minSweepTicks = input.int(1, "Minimum Sweep Distance (ticks)", minval=1, maxval=100, group="2. Advanced", tooltip="Minimum wick penetration beyond the previous liquidity level.")
-minConfirmScore = input.int(0, "Min Confirmation Score", minval=0, maxval=100, group="2. Advanced", tooltip="Zones with ConfirmationScore below this are not created. 0 = create all passing confirmations (V29 behavior). Raise to filter weaker confirmations.")
+zoneAnchorMode = input.string("Strict Wick", "Zone Body Anchor", options=["Strict Wick", "User Spec"], group="1. Core", tooltip="Strict Wick = true protruding wick only: bull top=min(O,C), bear bottom=max(O,C). User Spec = wider body anchor: bull top=max(O,C), bear bottom=min(O,C).")
+promoteC3OnFull = input.bool(true, "Promote c3 On Full Invalidation", group="1. Core")
 
-maxZones = input.int(100, "Maximum Zones", minval=1, maxval=450, group="3. Display")
-extendRight = input.bool(false, "Extend Zones Right", group="3. Display", tooltip="Default OFF. Zones are drawn from the HTF sweep candle to the HTF confirmation candle only.")
-showLabels = input.bool(false, "Show Zone Labels", group="3. Display")
-showDebugMarkers = input.bool(false, "Show Debug Markers (SW/NO)", group="3. Display", tooltip="Plot SW (sweep detected) and NO (confirmation failed) markers on the chart for diagnostic purposes.")
-showDashboard = input.bool(true, "Show Dashboard", group="3. Display")
-dashPos = input.string("top_right", "Dashboard Position", options=["top_left", "top_right", "bottom_left", "bottom_right"], group="3. Display")
-keepInvalidZones = input.bool(true, "Keep Invalidated Zones", group="4. Lifecycle", tooltip="If ON, invalidated zones remain gray. If OFF, invalidated zones are deleted. Fully mitigated zones are always deleted.")
-showPartialMitigatedZones = input.bool(true, "Show Partial Mitigated Zones", group="4. Lifecycle", tooltip="ON = show only the remaining unmitigated part after partial mitigation. OFF = hide/delete zones as soon as they are touched. Fully mitigated zones are always hidden.")
+maxZones = input.int(20, "Maximum Zones", minval=1, maxval=450, group="2. Display")
+extendFreshRight = input.bool(false, "Extend Fresh Zones Right", group="2. Display")
+extendMitigatedRight = input.bool(false, "Extend Mitigated Zones Right", group="2. Display")
+showLabels = input.bool(true, "Show Labels", group="2. Display")
+showZoneIds = input.bool(true, "Show Zone IDs In Labels", group="2. Display")
+showDtDebug = input.bool(false, "Show DT Debug Labels", group="2. Display")
+showC2Debug = input.bool(false, "Show C2/C3 Debug Markers", group="2. Display", tooltip="Shows compact labels for sweep candidates and c3 decisions to diagnose missing/fresh/mitigated zones.")
+dtDebugKeep = input.int(200, "DT Debug Labels To Keep", minval=1, maxval=450, group="2. Display", tooltip="TradingView max_labels_count is 500. Keep this below that to leave room for zone labels.")
+showDashboard = input.bool(false, "Show Dashboard", group="2. Display")
+dashPos = input.string("top_right", "Dashboard Position", options=["top_left", "top_right", "bottom_left", "bottom_right"], group="2. Display")
 
-bullColor = input.color(color.new(color.green, 80), "Bullish Zone Color", group="5. Colors")
-bearColor = input.color(color.new(color.red, 80), "Bearish Zone Color", group="5. Colors")
-mitColor = input.color(color.new(color.yellow, 80), "Mitigated Zone Color", group="5. Colors")
-invColor = input.color(color.new(color.gray, 82), "Invalid Zone Color", group="5. Colors")
+bullFreshColor = input.color(color.new(color.green, 82), "Bull Fresh", group="3. Colors")
+bearFreshColor = input.color(color.new(color.red, 82), "Bear Fresh", group="3. Colors")
+mitigatedColor = input.color(color.new(color.orange, 82), "Mitigated Zone", group="3. Colors")
 
-// Preset effective values.
-effLookback = quality == "Sensitive" ? 1 : quality == "Balanced" ? 1 : quality == "Strict" ? 3 : customLookback
-effMinBodyPct = quality == "Sensitive" ? 0.0 : quality == "Balanced" ? 0.35 : quality == "Strict" ? 0.50 : customMinBodyPct
-
-// Timeframe guard.
-chartSec = timeframe.in_seconds(timeframe.period)
-htfSec = timeframe.in_seconds(htfTf)
-isLowerThanHTF = chartSec < htfSec
-
-// Constants.
+// -----------------------------------------------------------------------------
+// Constants and types
+// -----------------------------------------------------------------------------
 DIR_BULL = 1
 DIR_BEAR = -1
 ST_FRESH = 0
 ST_MITIGATED = 1
-ST_INVALID = 2
 
-// Zone storage.
+// One structure, direction flag determines bullish/bearish logic.
 type Zone
+    int id
     int dir
     int status
-    float top
-    float bottom
+    float origTop
+    float origBottom
+    float dt
     int sweepTime
-    int confirmTime
-    int lastTouchHtfTime
-    float liquidityScore
-    float confirmationScore
+    int decisionTime
+    int lastUpdateTime
+    box bx
+    label lb
 
 var Zone[] zones = array.new<Zone>()
-var box[] boxes = array.new<box>()
-var label[] labels = array.new<label>()
-var int lastCreatedConfirmTime = na
-var float lastZoneScore = na
+var label[] dtDebugLabels = array.new<label>()
 
-// Dashboard event tracking.
-var string lastEvent = "???"
-var int lastEventTime = na
+// Pending c2 waiting for c3 decision.
+var bool pendActive = false
+var int pendDir = 0
+var float pendOrigTop = na
+var float pendOrigBottom = na
+var float pendDt = na
+var int pendSweepTime = na
+var int pendSweepCloseTime = na
 
-// Rejection reason tracking (debug markers).
-var string lastRejectReason = ""
-var label[] rejectLabels = array.new<label>()
+var string lastEvent = "Idle"
+var int htfEventsSeen = 0
 
-// Alert dedup timestamps (keep 1 bar of separation).
-var int lastAlertZoneMitTime = na
-var int lastAlertZoneFullTime = na
-var int lastAlertZoneInvalidTime = na
-var int lastAlertZoneDeletedTime = na
-var int lastAlertZoneEnterTime = na
+// -----------------------------------------------------------------------------
+// HTF data
+// -----------------------------------------------------------------------------
+// HTF candle feed. With lookahead_off, historical HTF values become available
+// only when the HTF candle is confirmed. This matches the earlier detection
+// style better than the extra [1] shift, which delayed/missed valid zones.
+[hTime, hCloseTime, hOpen, hHigh, hLow, hClose, liqHigh, liqLow, hAtr] = request.security(
+     syminfo.tickerid,
+     htfTf,
+     [time, time_close, open, high, low, close, ta.highest(high[1], lookback), ta.lowest(low[1], lookback), ta.atr(14)],
+     lookahead=barmerge.lookahead_off)
 
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// HTF strict-route engine
-// Runs entirely in HTF context.
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-f_htfStrict(simple int _lookback, simple float _minBodyPct, simple int _minSweepTicks, simple float _minConfirmScore) =>
-    var int pendingDir = 0
-    var float pOpen = na
-    var float pHigh = na
-    var float pLow = na
-    var float pClose = na
-    var int pSweepTime = na
-    var float pZoneTop = na
-    var float pZoneBottom = na
-    var float pSweptLevel = na
-    var float pLiquidityScore = na
-    var string pRejectReason = ""
+chartSec = timeframe.in_seconds(timeframe.period)
+htfSec = timeframe.in_seconds(htfTf)
+isLowerThanHTF = chartSec < htfSec
+chgHtfTime = ta.change(hTime)
+newHtf = isLowerThanHTF and not na(hTime) and chgHtfTime != 0
 
-    // ATR for scoring ??? must be at function root (not inside any conditional).
-    htfAtr = ta.atr(14)
+buf = syminfo.mintick * fullBufferTicks
+minSweep = syminfo.mintick * minSweepTicks
 
-    // Extracted for CW10003 consistency ??? called on every bar, not conditionally.
-    bearAgeRaw = ta.highestbars(high[1], _lookback)
-    bearPivot = ta.highest(high[1], _lookback * 2)
-    bearExtreme = ta.highest(high[1], _lookback * 4)
-    bullAgeRaw = ta.lowestbars(low[1], _lookback)
-    bullPivot = ta.lowest(low[1], _lookback * 2)
-    bullExtreme = ta.lowest(low[1], _lookback * 4)
-
-    int eventDir = 0
-    float eventTop = na
-    float eventBottom = na
-    int eventSweepTime = na
-    int eventConfirmTime = na
-    float eventLiquidityScore = na
-    int debugSweepDir = 0
-    int debugFailDir = 0
-    string eventRejectReason = ""
-    float eventConfirmationScore = na
-
-    // 1) Confirm previous pending sweep using the current HTF candle.
-    // V9.3: ConfirmationScore ??? continuous 4-factor scoring replaces binary nonOverlap.
-    if pendingDir != 0 and time > pSweepTime
-        confRng = math.max(high - low, syminfo.mintick)
-        safeAtr = math.max(htfAtr, syminfo.mintick)
-        if pendingDir == DIR_BULL
-            // Displacement Score (40%): how far close clears the zone top, normalized by ATR.
-            dispDist = close - pZoneTop
-            dispScore = math.min(math.max(dispDist / safeAtr * 200, 0), 100)
-            // Rejection Score (30%): how cleanly the candle avoids the zone.
-            overlapAmt = math.max(pZoneTop - low, 0)
-            zoneH = pZoneTop - pZoneBottom
-            rejScore = zoneH > 0 ? math.max(100 - overlapAmt / zoneH * 100, 0) : 100
-            // FVG Score (20%): gap between confirm low and zone top.
-            fvgGap = low - pZoneTop
-            fvgScore = fvgGap > 0 ? math.min(fvgGap / safeAtr * 333, 100) : 0
-            // Efficiency Score (10%): directional range ratio.
-            effScore = (close - low) / confRng * 100
-            // Weighted sum.
-            confScore = dispScore * 0.40 + rejScore * 0.30 + fvgScore * 0.20 + effScore * 0.10
-            if confScore >= _minConfirmScore
-                eventDir := DIR_BULL
-                eventTop := pZoneTop
-                eventBottom := pZoneBottom
-                eventSweepTime := pSweepTime
-                eventConfirmTime := time
-                eventLiquidityScore := pLiquidityScore
-                eventConfirmationScore := confScore
-            else
-                debugFailDir := DIR_BULL
-                pRejectReason := "Conf " + str.tostring(math.round(confScore, 0)) + " < " + str.tostring(_minConfirmScore) + "\nD:" + str.tostring(math.round(dispScore, 0)) + " R:" + str.tostring(math.round(rejScore, 0)) + "\nF:" + str.tostring(math.round(fvgScore, 0)) + " E:" + str.tostring(math.round(effScore, 0))
-        else if pendingDir == DIR_BEAR
-            // Displacement Score (40%): how far close clears the zone bottom.
-            dispDist = pZoneBottom - close
-            dispScore = math.min(math.max(dispDist / safeAtr * 200, 0), 100)
-            // Rejection Score (30%): how cleanly the candle avoids the zone.
-            overlapAmt = math.max(high - pZoneBottom, 0)
-            zoneH = pZoneTop - pZoneBottom
-            rejScore = zoneH > 0 ? math.max(100 - overlapAmt / zoneH * 100, 0) : 100
-            // FVG Score (20%): gap between zone bottom and confirm high.
-            fvgGap = pZoneBottom - high
-            fvgScore = fvgGap > 0 ? math.min(fvgGap / safeAtr * 333, 100) : 0
-            // Efficiency Score (10%): directional range ratio.
-            effScore = (high - close) / confRng * 100
-            // Weighted sum.
-            confScore = dispScore * 0.40 + rejScore * 0.30 + fvgScore * 0.20 + effScore * 0.10
-            if confScore >= _minConfirmScore
-                eventDir := DIR_BEAR
-                eventTop := pZoneTop
-                eventBottom := pZoneBottom
-                eventSweepTime := pSweepTime
-                eventConfirmTime := time
-                eventLiquidityScore := pLiquidityScore
-                eventConfirmationScore := confScore
-            else
-                debugFailDir := DIR_BEAR
-                pRejectReason := "Conf " + str.tostring(math.round(confScore, 0)) + " < " + str.tostring(_minConfirmScore) + "\nD:" + str.tostring(math.round(dispScore, 0)) + " R:" + str.tostring(math.round(rejScore, 0)) + "\nF:" + str.tostring(math.round(fvgScore, 0)) + " E:" + str.tostring(math.round(effScore, 0))
-
-        eventRejectReason := pRejectReason
-        pendingDir := 0
-        pOpen := na
-        pHigh := na
-        pLow := na
-        pClose := na
-        pSweepTime := na
-        pZoneTop := na
-        pZoneBottom := na
-        pSweptLevel := na
-        pLiquidityScore := na
-        pRejectReason := ""
-
-    // 2) Detect new HTF sweep candle for next-candle confirmation.
-    rng = math.max(high - low, syminfo.mintick)
-    body = math.abs(close - open)
-    bodyOk = _minBodyPct <= 0 or body / rng >= _minBodyPct
-
-    liqHigh = ta.highest(high[1], _lookback)
-    liqLow = ta.lowest(low[1], _lookback)
-
-    // Bearish strict route:
-    // wick sweeps previous high liquidity, candle closes back below it.
-    bearSweepDist = high - liqHigh
-    bearSweep = high > liqHigh and bearSweepDist >= syminfo.mintick * _minSweepTicks
-    bearCloseBack = close < liqHigh
-    bearZoneTop = high
-    bearZoneBottom = math.max(open, close)
-    bearHasWickZone = bearZoneTop > bearZoneBottom
-
-    // Bullish strict route:
-    // wick sweeps previous low liquidity, candle closes back above it.
-    bullSweepDist = liqLow - low
-    bullSweep = low < liqLow and bullSweepDist >= syminfo.mintick * _minSweepTicks
-    bullCloseBack = close > liqLow
-    bullZoneBottom = low
-    bullZoneTop = math.min(open, close)
-    bullHasWickZone = bullZoneTop > bullZoneBottom
-
-    // Candle nature (bearish/bullish) does not gate zone creation ??? sweep + closeback is sufficient.
-    validBear = pendingDir == 0 and bearSweep and bearCloseBack and bodyOk and bearHasWickZone
-    validBull = pendingDir == 0 and bullSweep and bullCloseBack and bodyOk and bullHasWickZone
-
-    if validBear and (not validBull or bearSweepDist >= bullSweepDist)
-        pendingDir := DIR_BEAR
-        pOpen := open
-        pHigh := high
-        pLow := low
-        pClose := close
-        pSweepTime := time
-        pZoneTop := bearZoneTop
-        pZoneBottom := bearZoneBottom
-        pSweptLevel := liqHigh
-        debugSweepDir := DIR_BEAR
-        // LiquidityScore: 5-factor institutional quality (bearish).
-        wPct = bearSweepDist / rng
-        aRatio = bearSweepDist / htfAtr
-        liqAge = math.abs(bearAgeRaw)
-        widerPivot = bearPivot
-        widerExtreme = bearExtreme
-        wS = math.min(wPct * 200, 100)
-        aS = na(htfAtr) or htfAtr <= 0 ? 50 : math.min(aRatio * 500, 100)
-        pS = na(widerPivot) ? 50 : (liqHigh == widerPivot ? 80 : 20)
-        eS = na(widerExtreme) ? 50 : (liqHigh == widerExtreme ? 100 : 30)
-        ageS = na(liqAge) ? 50 : math.min(liqAge * 10, 100)
-        bS = 50
-        pLiquidityScore := wS * 0.30 + aS * 0.20 + pS * 0.20 + eS * 0.15 + ageS * 0.10 + bS * 0.05
-    else if validBull
-        pendingDir := DIR_BULL
-        pOpen := open
-        pHigh := high
-        pLow := low
-        pClose := close
-        pSweepTime := time
-        pZoneTop := bullZoneTop
-        pZoneBottom := bullZoneBottom
-        pSweptLevel := liqLow
-        debugSweepDir := DIR_BULL
-        // LiquidityScore: 5-factor institutional quality (bullish).
-        wPct = bullSweepDist / rng
-        aRatio = bullSweepDist / htfAtr
-        liqAge = math.abs(bullAgeRaw)
-        widerPivot = bullPivot
-        widerExtreme = bullExtreme
-        wS = math.min(wPct * 200, 100)
-        aS = na(htfAtr) or htfAtr <= 0 ? 50 : math.min(aRatio * 500, 100)
-        pS = na(widerPivot) ? 50 : (liqLow == widerPivot ? 80 : 20)
-        eS = na(widerExtreme) ? 50 : (liqLow == widerExtreme ? 100 : 30)
-        ageS = na(liqAge) ? 50 : math.min(liqAge * 10, 100)
-        bS = 50
-        pLiquidityScore := wS * 0.30 + aS * 0.20 + pS * 0.20 + eS * 0.15 + ageS * 0.10 + bS * 0.05
-
-    [eventDir, eventTop, eventBottom, eventSweepTime, eventConfirmTime, debugSweepDir, debugFailDir, eventLiquidityScore, eventRejectReason, eventConfirmationScore, time, low, high]
-
-[eventDir, eventTop, eventBottom, eventSweepTime, eventConfirmTime, debugSweepDir, debugFailDir, eventLiquidityScore, eventRejectReason, eventConfirmationScore, currentHtfTime, currentHtfLow, currentHtfHigh] = request.security(syminfo.tickerid, htfTf, f_htfStrict(effLookback, effMinBodyPct, minSweepTicks, minConfirmScore), lookahead=barmerge.lookahead_off)
-
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Debug markers ??? plot SW (sweep) / NO (no-confirm) on chart
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Extract ta.change() to global scope to avoid CW10002 (short-circuit skip).
-chgSweepDir = ta.change(debugSweepDir)
-chgFailDir = ta.change(debugFailDir)
-
-dbgSweep = showDebugMarkers and debugSweepDir != 0
-dbgFail = showDebugMarkers and debugFailDir != 0
-dbgBullSweep = dbgSweep and debugSweepDir == DIR_BULL and chgSweepDir != 0
-dbgBearSweep = dbgSweep and debugSweepDir == DIR_BEAR and chgSweepDir != 0
-dbgBullFail = dbgFail and debugFailDir == DIR_BULL and chgFailDir != 0
-dbgBearFail = dbgFail and debugFailDir == DIR_BEAR and chgFailDir != 0
-
-plotshape(dbgBullSweep, "SW Bull", style=shape.triangledown, location=location.belowbar, color=color.new(color.green, 0), size=size.tiny)
-plotshape(dbgBearSweep, "SW Bear", style=shape.triangleup,   location=location.abovebar, color=color.new(color.red, 0),   size=size.tiny)
-plotshape(dbgBullFail,  "NO Bull", style=shape.xcross,        location=location.abovebar, color=color.new(color.purple, 0), size=size.tiny)
-plotshape(dbgBearFail,  "NO Bear", style=shape.xcross,        location=location.belowbar, color=color.new(color.orange, 0), size=size.tiny)
-
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Drawing helpers
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
 f_pos(string p) =>
     switch p
         "top_left" => position.top_left
@@ -309,368 +113,340 @@ f_pos(string p) =>
         "bottom_right" => position.bottom_right
         => position.top_right
 
-f_deleteZone(int i) =>
-    bx = array.get(boxes, i)
-    lb = array.get(labels, i)
-    if not na(bx)
-        box.delete(bx)
-    if not na(lb)
-        label.delete(lb)
-    array.remove(zones, i)
-    array.remove(boxes, i)
-    array.remove(labels, i)
+f_statusText(int st) =>
+    st == ST_FRESH ? "Fresh" : "Mitigated"
+
+f_dirText(int dir) =>
+    dir == DIR_BULL ? "Bull" : "Bear"
+
+f_dtPriceText(float v) =>
+    na(v) ? "na" : str.tostring(v, format.mintick)
+
+f_visibleTop(Zone z) =>
+    z.dir == DIR_BULL ? z.dt : z.origTop
+
+f_visibleBottom(Zone z) =>
+    z.dir == DIR_BULL ? z.origBottom : z.dt
+
+f_color(Zone z) =>
+    z.status == ST_MITIGATED ? mitigatedColor : (z.dir == DIR_BULL ? bullFreshColor : bearFreshColor)
+
+f_shouldExtend(Zone z) =>
+    z.status == ST_FRESH ? extendFreshRight : z.status == ST_MITIGATED ? extendMitigatedRight : false
 
 f_zoneText(Zone z) =>
-    (z.dir == DIR_BULL ? "HTF Bull OB" : "HTF Bear OB") + "\n" + (z.status == ST_FRESH ? "Fresh" : z.status == ST_MITIGATED ? "Mitigated" : "Invalid") + "\n" + str.tostring(z.bottom, format.mintick) + " - " + str.tostring(z.top, format.mintick) + "\nLiq: " + (na(z.liquidityScore) ? "???" : str.tostring(math.round(z.liquidityScore, 0))) + " Conf: " + (na(z.confirmationScore) ? "???" : str.tostring(math.round(z.confirmationScore, 0)))
+    (showZoneIds ? "#" + str.tostring(z.id) + " " : "") + f_dirText(z.dir) + " HTF OB" +
+     "\nStatus: " + f_statusText(z.status) +
+     "\nOrig: " + str.tostring(z.origBottom, format.mintick) + " - " + str.tostring(z.origTop, format.mintick) +
+     "\nDT: " + f_dtPriceText(z.dt) +
+     "\nVisible: " + str.tostring(f_visibleBottom(z), format.mintick) + " - " + str.tostring(f_visibleTop(z), format.mintick)
 
-f_setVisual(Zone z, box bx, label lb) =>
-    c = z.status == ST_FRESH ? (z.dir == DIR_BULL ? bullColor : bearColor) : z.status == ST_MITIGATED ? mitColor : invColor
-    if not na(bx)
-        box.set_border_color(bx, color.new(c, 0))
-        box.set_bgcolor(bx, c)
-    if not na(lb)
-        label.set_color(lb, color.new(c, 0))
-        label.set_text(lb, f_zoneText(z))
+f_overlap(int dir, float top, float bottom, float hi, float lo) =>
+    // Any intersection with the original zone range.
+    hi >= bottom and lo <= top
 
-f_createZone(int dir, float top, float bottom, int sweepT, int confirmT, float liqScore, float confScore) =>
+f_fullTraversal(int dir, float top, float bottom, float hi, float lo, float cl) =>
+    // Full traversal requires reaching the far edge and closing beyond it.
+    dir == DIR_BULL ? (lo <= bottom - buf and cl < bottom - buf) : (hi >= top + buf and cl > top + buf)
+
+f_deepestInside(int dir, float top, float bottom, float hi, float lo) =>
+    // DT is a price inside the zone. Clamp extremes to the original zone range.
+    dir == DIR_BULL ? math.max(lo, bottom) : math.min(hi, top)
+
+f_goesDeeper(int dir, float candidateDt, float currentDt) =>
+    dir == DIR_BULL ? candidateDt < currentDt - syminfo.mintick * minDtMoveTicks : candidateDt > currentDt + syminfo.mintick * minDtMoveTicks
+
+f_pushDebug(string txt, int x, float y, color c) =>
+    if showDtDebug
+        lb = label.new(x, y, txt, xloc=xloc.bar_time, style=label.style_label_left, color=c, textcolor=color.white, size=size.small)
+        array.push(dtDebugLabels, lb)
+        while array.size(dtDebugLabels) > dtDebugKeep
+            old = array.shift(dtDebugLabels)
+            if not na(old)
+                label.delete(old)
+
+f_pushCoreDebug(string txt, int x, float y, color c) =>
+    if showDtDebug or showC2Debug
+        lb = label.new(x, y, txt, xloc=xloc.bar_time, style=label.style_label_left, color=c, textcolor=color.white, size=size.small)
+        array.push(dtDebugLabels, lb)
+        while array.size(dtDebugLabels) > dtDebugKeep
+            old = array.shift(dtDebugLabels)
+            if not na(old)
+                label.delete(old)
+
+f_deleteZone(int i) =>
+    z = array.get(zones, i)
+    if not na(z.bx)
+        box.delete(z.bx)
+    if not na(z.lb)
+        label.delete(z.lb)
+    array.remove(zones, i)
+
+f_applyVisual(int i) =>
+    z = array.get(zones, i)
+    c = f_color(z)
+    vTop = f_visibleTop(z)
+    vBottom = f_visibleBottom(z)
+    if not na(z.bx)
+        box.set_top(z.bx, vTop)
+        box.set_bottom(z.bx, vBottom)
+        box.set_bgcolor(z.bx, c)
+        box.set_border_color(z.bx, color.new(c, 0))
+        box.set_right(z.bx, z.lastUpdateTime)
+        box.set_extend(z.bx, f_shouldExtend(z) ? extend.right : extend.none)
+    if showLabels
+        if na(z.lb)
+            z.lb := label.new(z.lastUpdateTime, z.dir == DIR_BULL ? vBottom : vTop, f_zoneText(z), xloc=xloc.bar_time, style=z.dir == DIR_BULL ? label.style_label_up : label.style_label_down, color=color.new(c, 0), textcolor=color.white, size=size.small)
+        else
+            label.set_x(z.lb, z.lastUpdateTime)
+            label.set_y(z.lb, z.dir == DIR_BULL ? vBottom : vTop)
+            label.set_text(z.lb, f_zoneText(z))
+            label.set_color(z.lb, color.new(c, 0))
+    else if not na(z.lb)
+        label.delete(z.lb)
+        z.lb := na
+    array.set(zones, i, z)
+
+f_addZone(int dir, int status, float top, float bottom, float dt, int sweepT, int decisionT, string reason) =>
     while array.size(zones) >= maxZones
         f_deleteZone(0)
 
     z = Zone.new()
+    z.id := array.size(zones) + 1
     z.dir := dir
-    z.status := ST_FRESH
-    z.top := top
-    z.bottom := bottom
+    z.status := status
+    z.origTop := top
+    z.origBottom := bottom
+    z.dt := dt
     z.sweepTime := sweepT
-    z.confirmTime := confirmT
-    z.lastTouchHtfTime := na
-    z.liquidityScore := liqScore
-    z.confirmationScore := confScore
+    z.decisionTime := decisionT
+    z.lastUpdateTime := decisionT
+
+    vTop = dir == DIR_BULL ? dt : top
+    vBottom = dir == DIR_BULL ? bottom : dt
+    c = status == ST_MITIGATED ? mitigatedColor : (dir == DIR_BULL ? bullFreshColor : bearFreshColor)
+    z.bx := box.new(sweepT, vTop, decisionT, vBottom, xloc=xloc.bar_time, extend=status == ST_FRESH ? (extendFreshRight ? extend.right : extend.none) : (extendMitigatedRight ? extend.right : extend.none), border_color=color.new(c, 0), bgcolor=c)
+    z.lb := na
     array.push(zones, z)
+    f_applyVisual(array.size(zones) - 1)
 
-    c = dir == DIR_BULL ? bullColor : bearColor
-    bx = box.new(sweepT, top, confirmT, bottom, xloc=xloc.bar_time, extend=extendRight ? extend.right : extend.none, border_color=color.new(c, 0), bgcolor=c)
-    array.push(boxes, bx)
+    f_pushDebug("ADD ZONE #" + str.tostring(z.id) +
+     "\nReason: " + reason +
+     "\nDir: " + f_dirText(dir) +
+     "\nStatus: " + f_statusText(status) +
+     "\nOrigTop: " + str.tostring(top, format.mintick) +
+     "\nOrigBottom: " + str.tostring(bottom, format.mintick) +
+     "\nDT: " + str.tostring(dt, format.mintick) +
+     "\nVisibleTop: " + str.tostring(vTop, format.mintick) +
+     "\nVisibleBottom: " + str.tostring(vBottom, format.mintick), decisionT, dir == DIR_BULL ? vBottom : vTop, color.new(color.blue, 0))
 
-    if showLabels
-        lb = label.new(confirmT, dir == DIR_BULL ? bottom : top, f_zoneText(z), xloc=xloc.bar_time, style=dir == DIR_BULL ? label.style_label_up : label.style_label_down, color=color.new(c, 0), textcolor=color.white, size=size.small)
-        array.push(labels, lb)
-    else
-        array.push(labels, label(na))
 
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Zone creation ??? guarded by chart TF < HTF
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Use currentHtfTime (built-in `time` returned as element 11) instead of
-// eventConfirmTime (element 5) because request.security() truncates local
-// int variables assigned from `time` to 1/10th of the correct epoch ms value.
-// Using currentHtfTime ensures the zone's confirmTime has full precision,
-// which is critical for xloc.bar_time box positioning and the
-// currentHtfTime > z.confirmTime lifecycle gate in Pass 1.
-newZone = isLowerThanHTF and eventDir != 0 and not na(currentHtfTime) and (na(lastCreatedConfirmTime) or currentHtfTime != lastCreatedConfirmTime)
-if newZone
-    f_createZone(eventDir, eventTop, eventBottom, eventSweepTime, currentHtfTime, eventLiquidityScore, eventConfirmationScore)
-    lastZoneScore := eventLiquidityScore
-    lastCreatedConfirmTime := currentHtfTime
-    scoreStr = na(eventLiquidityScore) ? "" : " [" + str.tostring(math.round(eventLiquidityScore, 0)) + "]"
-    lastEvent := (eventDir == DIR_BULL ? "New Bull Zone" : "New Bear Zone") + scoreStr
-    lastEventTime := currentHtfTime
+f_zoneFromCandle(int dir, float o, float h, float l, float c) =>
+    // Returns [top, bottom]. User Spec follows latest DT definition.
+    bullTop = zoneAnchorMode == "User Spec" ? math.max(o, c) : math.min(o, c)
+    bearBottom = zoneAnchorMode == "User Spec" ? math.min(o, c) : math.max(o, c)
+    top = dir == DIR_BULL ? bullTop : h
+    bottom = dir == DIR_BULL ? l : bearBottom
+    [top, bottom]
 
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Rejection reason label + dashboard event ??? fires when a sweep
-// fails confirmation (debugFailDir != 0). Shows the reason inline
-// on chart and updates the dashboard "Last Event" row.
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-rejectHappened = isLowerThanHTF and debugFailDir != 0 and chgFailDir != 0 and eventRejectReason != ""
-if rejectHappened
-    lastRejectReason := eventRejectReason
-    lastEvent := "NO: " + (debugFailDir == DIR_BULL ? "Bull" : "Bear") + " ??? Wick Overlap"
-    lastEventTime := time
-    if showDebugMarkers
-        rejPrice = debugFailDir == DIR_BULL ? high : low
-        rejLb = label.new(time, rejPrice, eventRejectReason, xloc=xloc.bar_time,
-         style=debugFailDir == DIR_BULL ? label.style_label_down : label.style_label_up,
-         color=color.new(color.purple, 0), textcolor=color.white, size=size.small)
-        array.push(rejectLabels, rejLb)
-        // Bound at 50 ??? delete oldest when exceeded.
-        if array.size(rejectLabels) > 50
-            oldLb = array.shift(rejectLabels)
-            if not na(oldLb)
-                label.delete(oldLb)
-if barstate.islast and not showDebugMarkers and array.size(rejectLabels) > 0
-    for i = 0 to array.size(rejectLabels) - 1
-        label.delete(array.get(rejectLabels, i))
-    array.clear(rejectLabels)
+// -----------------------------------------------------------------------------
+// Main HTF step engine
+// -----------------------------------------------------------------------------
+if newHtf
+    htfEventsSeen += 1
 
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Visual-only zone trim (real-time bars only)
-// Updates the box visual immediately when price enters the zone on a
-// forming bar. Zone state is NEVER modified here ??? only the box draw.
-// This prevents TF-dependent zone sizes (Pass 2 uses chart low/high
-// which change between TFs) while still providing real-time feedback.
-// When price leaves the zone, the box reverts to the saved zone state.
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-if isLowerThanHTF and not barstate.isconfirmed and array.size(zones) > 0
-    i = array.size(zones) - 1
-    while i >= 0
-        z_vis = array.get(zones, i)
-        bx_vis = array.get(boxes, i)
-        if z_vis.status != ST_INVALID and not na(bx_vis)
-            if showPartialMitigatedZones
-                chartEnter = z_vis.dir == DIR_BULL ? (low < z_vis.top and low > z_vis.bottom) : (high > z_vis.bottom and high < z_vis.top)
-                if chartEnter
-                    // Trim the box to current bar's extreme (no state change)
-                    if z_vis.dir == DIR_BULL
-                        box.set_top(bx_vis, low)
-                    else
-                        box.set_bottom(bx_vis, high)
-                else
-                    // Revert box to saved zone state when price is outside
-                    if z_vis.dir == DIR_BULL
-                        box.set_top(bx_vis, z_vis.top)
-                    else
-                        box.set_bottom(bx_vis, z_vis.bottom)
-            // When showPartialMitigatedZones=false: leave box at saved state
-            // (zone will be deleted on the next confirmed bar via Pass 2)
-        i -= 1
+    // 1) Resolve pending c2 with immediate next candle c3.
+    promoted = false
+    if pendActive
+        overlap = f_overlap(pendDir, pendOrigTop, pendOrigBottom, hHigh, hLow)
+        full = f_fullTraversal(pendDir, pendOrigTop, pendOrigBottom, hHigh, hLow, hClose)
+        c3Dt = f_deepestInside(pendDir, pendOrigTop, pendOrigBottom, hHigh, hLow)
+        deeper = overlap and f_goesDeeper(pendDir, c3Dt, pendDt)
+        decisionTxt = not overlap ? "FRESH - no overlap" : full ? "FULL/PROMOTE" : deeper ? "MITIGATED - deeper DT" : "FRESH - overlap not deeper"
 
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Stateful mitigation lifecycle (confirmed bars only)
-// Zone state (top/bottom/status) is saved to array only here.
-// This makes zone dimensions TF-independent ??? they use the same
-// bar data regardless of chart timeframe.
-//   Pass 1 (HTF):   Size trimming using currentHtfLow/currentHtfHigh.
-//                    Gated by currentHtfTime > z.confirmTime.
-//   Pass 2 (Chart):  Immediate state save using chart-TF low/high.
-//                    Runs on every confirmed bar that enters the zone.
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-if isLowerThanHTF and barstate.isconfirmed
-    if array.size(zones) > 0
-        i = array.size(zones) - 1
-        while i >= 0
-            z = array.get(zones, i)
-            bx = array.get(boxes, i)
-            lb = array.get(labels, i)
-            oldStatus = z.status
-            oldTop = z.top
-            oldBottom = z.bottom
-            deleteZoneNow = false
+        f_pushCoreDebug("C3 DECISION" +
+         "\nDir: " + f_dirText(pendDir) +
+         "\nZone Top/Bottom: " + str.tostring(pendOrigTop, format.mintick) + " / " + str.tostring(pendOrigBottom, format.mintick) +
+         "\nCurrent DT: " + str.tostring(pendDt, format.mintick) +
+         "\nc3 H/L/C: " + str.tostring(hHigh, format.mintick) + " / " + str.tostring(hLow, format.mintick) + " / " + str.tostring(hClose, format.mintick) +
+         "\nOverlap: " + str.tostring(overlap) +
+         "\nFull: " + str.tostring(full) +
+         "\nc3 DT candidate: " + str.tostring(c3Dt, format.mintick) +
+         "\nGoes deeper: " + str.tostring(deeper) +
+         "\nDecision: " + decisionTxt +
+         "\nMin DT Move ticks: " + str.tostring(minDtMoveTicks), hCloseTime, pendDir == DIR_BULL ? pendOrigBottom : pendOrigTop, color.new(color.navy, 0))
 
-            // ?????? Pass 1: HTF-size trimming (timeframe-independent final size) ??????
-            //   Only fires when the HTF bar advances past the confirmation candle.
-            // ?????? Pass 2: Chart-TF trimming (responsive state save) ??????
-            //   Fires on the first confirmed bar that enters the zone.
-
-            // ?????? Pass 1: HTF-size trimming (timeframe-independent final size) ??????
-            if z.status != ST_INVALID and currentHtfTime > z.confirmTime
-                if z.dir == DIR_BULL
-                    htfFull = currentHtfLow <= z.bottom
-                    htfPartial = currentHtfLow < z.top and currentHtfLow > z.bottom
-                    if htfFull
-                        deleteZoneNow := true
-                        if time != lastAlertZoneFullTime
-                            lastAlertZoneFullTime := time
-                            lastEvent := "Bull zone full mit"
-                            lastEventTime := time
-                    else if htfPartial
-                        if showPartialMitigatedZones
-                            z.top := currentHtfLow
-                            z.status := ST_MITIGATED
-                        else
-                            deleteZoneNow := true
-                        if time != lastAlertZoneMitTime
-                            lastAlertZoneMitTime := time
-                            lastEvent := "Bull zone partial"
-                            lastEventTime := time
-                else
-                    htfFull = currentHtfHigh >= z.top
-                    htfPartial = currentHtfHigh > z.bottom and currentHtfHigh < z.top
-                    if htfFull
-                        deleteZoneNow := true
-                        if time != lastAlertZoneFullTime
-                            lastAlertZoneFullTime := time
-                            lastEvent := "Bear zone full mit"
-                            lastEventTime := time
-                    else if htfPartial
-                        if showPartialMitigatedZones
-                            z.bottom := currentHtfHigh
-                            z.status := ST_MITIGATED
-                        else
-                            deleteZoneNow := true
-                        if time != lastAlertZoneMitTime
-                            lastAlertZoneMitTime := time
-                            lastEvent := "Bear zone partial"
-                            lastEventTime := time
-
-                invalid = z.dir == DIR_BULL ? currentHtfLow < z.bottom : currentHtfHigh > z.top
-                if invalid and not deleteZoneNow
-                    z.status := ST_INVALID
-                    if time != lastAlertZoneInvalidTime
-                        lastAlertZoneInvalidTime := time
-                        lastEvent := "Zone invalid"
-                        lastEventTime := time
-
-            // ?????? Pass 2: Chart-TF immediate trimming (responsive) ??????
-            // Uses chart low/high so zones respond the instant a candle wick
-            // enters the zone. The size will be refined by Pass 1 when HTF
-            // data advances (converging to the same final size on all TFs).
-            if z.status != ST_INVALID and not deleteZoneNow
-                chartFull = z.dir == DIR_BULL ? (low <= z.bottom) : (high >= z.top)
-                chartPartial = z.dir == DIR_BULL ? (low < z.top and low > z.bottom) : (high > z.bottom and high < z.top)
-                if chartFull
-                    deleteZoneNow := true
-                    if time != lastAlertZoneFullTime
-                        lastAlertZoneFullTime := time
-                        lastEvent := z.dir == DIR_BULL ? "Bull zone full mit" : "Bear zone full mit"
-                        lastEventTime := time
-                else if chartPartial
-                    if showPartialMitigatedZones
-                        if z.dir == DIR_BULL
-                            z.top := low
-                        else
-                            z.bottom := high
-                        z.status := ST_MITIGATED
-                    else
-                        deleteZoneNow := true
-                    if time != lastAlertZoneMitTime
-                        lastAlertZoneMitTime := time
-                        lastEvent := z.dir == DIR_BULL ? "Bull zone partial" : "Bear zone partial"
-                        lastEventTime := time
-
-            if deleteZoneNow
-                if time != lastAlertZoneDeletedTime
-                    lastAlertZoneDeletedTime := time
-                f_deleteZone(i)
+        if not overlap
+            f_addZone(pendDir, ST_FRESH, pendOrigTop, pendOrigBottom, pendDt, pendSweepTime, hCloseTime, "c3 no overlap")
+            lastEvent := "Fresh " + f_dirText(pendDir) + " zone"
+            pendActive := false
+            pendDir := 0
+            pendOrigTop := na
+            pendOrigBottom := na
+            pendDt := na
+            pendSweepTime := na
+            pendSweepCloseTime := na
+        else if full
+            // Old c2 zone is invalid. Optional promotion: c3 becomes new c2.
+            oldDir = pendDir
+            f_pushDebug("c3 FULL INVALIDATION" +
+             "\nOld Dir: " + f_dirText(oldDir) +
+             "\nOld Top/Bottom: " + str.tostring(pendOrigTop, format.mintick) + " / " + str.tostring(pendOrigBottom, format.mintick) +
+             "\nc3 H/L/C: " + str.tostring(hHigh, format.mintick) + " / " + str.tostring(hLow, format.mintick) + " / " + str.tostring(hClose, format.mintick) +
+             "\nPromote c3: " + str.tostring(promoteC3OnFull), hCloseTime, oldDir == DIR_BULL ? pendOrigBottom : pendOrigTop, color.new(color.red, 0))
+            pendActive := false
+            pendDir := 0
+            pendOrigTop := na
+            pendOrigBottom := na
+            pendDt := na
+            pendSweepTime := na
+            pendSweepCloseTime := na
+            if promoteC3OnFull
+                [pTop, pBottom] = f_zoneFromCandle(oldDir, hOpen, hHigh, hLow, hClose)
+                pendActive := true
+                pendDir := oldDir
+                pendOrigTop := pTop
+                pendOrigBottom := pBottom
+                pendDt := oldDir == DIR_BULL ? pTop : pBottom
+                pendSweepTime := hTime
+                pendSweepCloseTime := hCloseTime
+                f_pushDebug("PENDING c2" +
+                 "\nReason: promoted c3 after full invalidation" +
+                 "\nDir: " + f_dirText(oldDir) +
+                 "\nOrigTop: " + str.tostring(pTop, format.mintick) +
+                 "\nOrigBottom: " + str.tostring(pBottom, format.mintick) +
+                 "\nInitial DT: " + str.tostring(pendDt, format.mintick), hCloseTime, oldDir == DIR_BULL ? pBottom : pTop, color.new(color.purple, 0))
+                promoted := true
+                lastEvent := "c3 promoted as new sweep"
             else
-                // Retroactive label creation ??? runs every bar, independent of state change.
-                // Handles zones created while showLabels=OFF; the labels[] entry is still na
-                // and needs a real label.new() to become visible.
-                if showLabels and na(lb)
-                    c = z.status == ST_FRESH ? (z.dir == DIR_BULL ? bullColor : bearColor) : z.status == ST_MITIGATED ? mitColor : invColor
-                    newLb = label.new(z.confirmTime, z.dir == DIR_BULL ? z.bottom : z.top, f_zoneText(z), xloc=xloc.bar_time, style=z.dir == DIR_BULL ? label.style_label_up : label.style_label_down, color=color.new(c, 0), textcolor=color.white, size=size.small)
-                    array.set(labels, i, newLb)
-                    lb := newLb
-                    f_setVisual(z, bx, lb)
-                boundsChanged = oldTop != z.top or oldBottom != z.bottom
-                if oldStatus != z.status or boundsChanged
-                    if not na(bx) and boundsChanged
-                        box.set_top(bx, z.top)
-                        box.set_bottom(bx, z.bottom)
-                        // Make the trimmed remainder visible at the mitigation candle even when Extend Right is OFF.
-                        box.set_right(bx, time)
-                    if not na(lb) and boundsChanged
-                        label.set_x(lb, time)
-                        label.set_y(lb, z.dir == DIR_BULL ? z.bottom : z.top)
-                    f_setVisual(z, bx, lb)
+                lastEvent := "c3 full invalidation"
+        else
+            // If c3 overlaps but does NOT go deeper than the initial body-extreme DT,
+            // it has not consumed any new part of the zone. Keep it Fresh.
+            // Only mark Mitigated when DT actually moves deeper.
+            newDt = deeper ? c3Dt : pendDt
+            newStatus = deeper ? ST_MITIGATED : ST_FRESH
+            f_addZone(pendDir, newStatus, pendOrigTop, pendOrigBottom, newDt, pendSweepTime, hCloseTime, deeper ? "c3 partial overlap deeper" : "c3 overlap but not deeper -> fresh")
+            lastEvent := (deeper ? "Mitigated " : "Fresh ") + f_dirText(pendDir) + " zone"
+            pendActive := false
+            pendDir := 0
+            pendOrigTop := na
+            pendOrigBottom := na
+            pendDt := na
+            pendSweepTime := na
+            pendSweepCloseTime := na
 
-                if not na(bx)
-                    if z.status == ST_INVALID
-                        box.set_extend(bx, extend.none)
-                    else if extendRight
-                        box.set_right(bx, time)
-
-                array.set(zones, i, z)
-            i -= 1
-
-    if not keepInvalidZones and array.size(zones) > 0
-        i = array.size(zones) - 1
-        while i >= 0
+    // 2) Update active zones using future Cx candles.
+    //    Only update when the candle goes deeper than the current DT.
+    if array.size(zones) > 0
+        for i = 0 to array.size(zones) - 1
             z = array.get(zones, i)
-            if z.status == ST_INVALID
-                f_deleteZone(i)
-            i -= 1
+            // Avoid updating a zone on the same HTF candle that decided/created it.
+            if hCloseTime > z.decisionTime
+                overlapsCx = f_overlap(z.dir, z.origTop, z.origBottom, hHigh, hLow)
+                if overlapsCx
+                    cxDt = f_deepestInside(z.dir, z.origTop, z.origBottom, hHigh, hLow)
+                    if f_goesDeeper(z.dir, cxDt, z.dt)
+                        oldDt = z.dt
+                        z.dt := cxDt
+                        z.status := ST_MITIGATED
+                        z.lastUpdateTime := hCloseTime
+                        array.set(zones, i, z)
+                        f_applyVisual(i)
+                        lastEvent := "DT deeper: " + f_dirText(z.dir)
+                        f_pushDebug("DT UPDATE" +
+                         "\nDir: " + f_dirText(z.dir) +
+                         "\nOld DT: " + str.tostring(oldDt, format.mintick) +
+                         "\nNew DT: " + str.tostring(cxDt, format.mintick) +
+                         "\nOrigTop: " + str.tostring(z.origTop, format.mintick) +
+                         "\nOrigBottom: " + str.tostring(z.origBottom, format.mintick) +
+                         "\nCx H/L/C: " + str.tostring(hHigh, format.mintick) + " / " + str.tostring(hLow, format.mintick) + " / " + str.tostring(hClose, format.mintick), hCloseTime, z.dir == DIR_BULL ? f_visibleBottom(z) : f_visibleTop(z), color.new(color.teal, 0))
 
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Price-enter zone detection for alerts
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-priceEnterBullZone = false
-priceEnterBearZone = false
-if isLowerThanHTF and barstate.isconfirmed and array.size(zones) > 0
+    // 3) If c3 was not promoted into a new pending zone, detect a new c2 sweep.
+    if not pendActive and not promoted
+        bearSweepDist = hHigh - liqHigh
+        bullSweepDist = liqLow - hLow
+        bearSweep = not na(liqHigh) and hHigh > liqHigh and bearSweepDist >= minSweep and hClose < liqHigh
+        bullSweep = not na(liqLow) and hLow < liqLow and bullSweepDist >= minSweep and hClose > liqLow
+
+        if showC2Debug and (bearSweep or bullSweep)
+            f_pushCoreDebug("C2 SWEEP CANDIDATE" +
+             "\nBearSweep: " + str.tostring(bearSweep) + " dist=" + str.tostring(bearSweepDist, format.mintick) +
+             "\nBullSweep: " + str.tostring(bullSweep) + " dist=" + str.tostring(bullSweepDist, format.mintick) +
+             "\nLiqHigh/Low: " + str.tostring(liqHigh, format.mintick) + " / " + str.tostring(liqLow, format.mintick) +
+             "\nO/H/L/C: " + str.tostring(hOpen, format.mintick) + " / " + str.tostring(hHigh, format.mintick) + " / " + str.tostring(hLow, format.mintick) + " / " + str.tostring(hClose, format.mintick) +
+             "\nStrict bull/bear body: " + str.tostring(math.min(hOpen, hClose), format.mintick) + " / " + str.tostring(math.max(hOpen, hClose), format.mintick) +
+             "\nUser bull/bear body: " + str.tostring(math.max(hOpen, hClose), format.mintick) + " / " + str.tostring(math.min(hOpen, hClose), format.mintick), hCloseTime, hHigh, color.new(color.maroon, 0))
+
+        chosenDir = 0
+        if bearSweep and bullSweep
+            if dualSweepMode == "Candle Direction"
+                chosenDir := hClose >= hOpen ? DIR_BULL : DIR_BEAR
+            else
+                chosenDir := bearSweepDist >= bullSweepDist ? DIR_BEAR : DIR_BULL
+        else if bearSweep
+            chosenDir := DIR_BEAR
+        else if bullSweep
+            chosenDir := DIR_BULL
+
+        if chosenDir != 0
+            [zTop, zBottom] = f_zoneFromCandle(chosenDir, hOpen, hHigh, hLow, hClose)
+            if zTop > zBottom
+                pendActive := true
+                pendDir := chosenDir
+                pendOrigTop := zTop
+                pendOrigBottom := zBottom
+                pendDt := chosenDir == DIR_BULL ? zTop : zBottom
+                pendSweepTime := hTime
+                pendSweepCloseTime := hCloseTime
+                f_pushDebug("PENDING c2" +
+                 "\nReason: sweep c2" +
+                 "\nDual mode: " + dualSweepMode +
+                 "\nAnchor mode: " + zoneAnchorMode +
+                 "\nDir: " + f_dirText(chosenDir) +
+                 "\nBear/Bull Sweep: " + str.tostring(bearSweep) + " / " + str.tostring(bullSweep) +
+                 "\nOrigTop: " + str.tostring(zTop, format.mintick) +
+                 "\nOrigBottom: " + str.tostring(zBottom, format.mintick) +
+                 "\nInitial DT: " + str.tostring(pendDt, format.mintick), hCloseTime, chosenDir == DIR_BULL ? zBottom : zTop, color.new(color.purple, 0))
+                lastEvent := "Pending " + f_dirText(chosenDir) + " c2"
+
+// Clean debug labels when disabled.
+if barstate.islast and not showDtDebug and not showC2Debug and array.size(dtDebugLabels) > 0
+    for i = 0 to array.size(dtDebugLabels) - 1
+        label.delete(array.get(dtDebugLabels, i))
+    array.clear(dtDebugLabels)
+
+// Refresh visuals on last bar for extension/label toggles.
+if barstate.islast and array.size(zones) > 0
     for i = 0 to array.size(zones) - 1
-        z_ent = array.get(zones, i)
-        if z_ent.status != ST_INVALID
-            if z_ent.dir == DIR_BULL and high >= z_ent.bottom and low <= z_ent.top
-                priceEnterBullZone := true
-            if z_ent.dir == DIR_BEAR and low <= z_ent.top and high >= z_ent.bottom
-                priceEnterBearZone := true
+        f_applyVisual(i)
 
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// Alert conditions ??? series expressions only (no functions)
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-// ta.change() extracted to global scope to avoid CW10002 + bool/int issues.
-chgEnterBull = ta.change(priceEnterBullZone)
-chgEnterBear = ta.change(priceEnterBearZone)
-
-alert_newBull = newZone and eventDir == DIR_BULL
-alert_newBear = newZone and eventDir == DIR_BEAR
-alert_partialMit = time == lastAlertZoneMitTime
-alert_fullMit = time == lastAlertZoneFullTime
-alert_invalid = time == lastAlertZoneInvalidTime
-alert_deleted = time == lastAlertZoneDeletedTime
-alert_enterBull = priceEnterBullZone and chgEnterBull
-alert_enterBear = priceEnterBearZone and chgEnterBear
-
-alertcondition(alert_newBull,    "New Bullish OB",  "{{ticker}} {{interval}}: New bullish strict HTF wick sweep OB")
-alertcondition(alert_newBear,    "New Bearish OB",  "{{ticker}} {{interval}}: New bearish strict HTF wick sweep OB")
-alertcondition(alert_enterBull,  "Enter Bull Zone", "{{ticker}} {{interval}}: Price entered bullish HTF OB zone")
-alertcondition(alert_enterBear,  "Enter Bear Zone", "{{ticker}} {{interval}}: Price entered bearish HTF OB zone")
-alertcondition(alert_partialMit, "Zone Partial Mit","{{ticker}} {{interval}}: HTF OB zone partially mitigated")
-alertcondition(alert_fullMit,    "Zone Full Mit",   "{{ticker}} {{interval}}: HTF OB zone fully mitigated")
-alertcondition(alert_invalid,    "Zone Invalid",    "{{ticker}} {{interval}}: HTF OB zone invalidated")
-alertcondition(alert_deleted,    "Zone Deleted",    "{{ticker}} {{interval}}: HTF OB zone removed from chart")
-
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+// -----------------------------------------------------------------------------
 // Dashboard
-// ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-var table dash = table.new(f_pos(dashPos), 2, 13, frame_color=color.gray, frame_width=1)
+// -----------------------------------------------------------------------------
+var table dash = table.new(f_pos(dashPos), 2, 10, frame_color=color.gray, frame_width=1)
 if barstate.islast and showDashboard
-    table.clear(dash, 0, 0, 1, 12)
-    table.cell(dash, 0, 0, isLowerThanHTF ? "HTF OB V29 Strict" : "HTF OB DISABLED", text_color=color.white, bgcolor=isLowerThanHTF ? color.new(color.blue, 25) : color.new(color.red, 10))
+    table.clear(dash, 0, 0, 1, 9)
+    table.cell(dash, 0, 0, isLowerThanHTF ? "Clean DT Core v1.6" : "DISABLED", text_color=color.white, bgcolor=isLowerThanHTF ? color.new(color.blue, 25) : color.new(color.red, 10))
     table.cell(dash, 1, 0, syminfo.ticker, text_color=color.white, bgcolor=isLowerThanHTF ? color.new(color.blue, 25) : color.new(color.red, 10))
     table.cell(dash, 0, 1, "Chart / HTF", text_color=color.gray)
     table.cell(dash, 1, 1, timeframe.period + " / " + htfTf)
-    if not isLowerThanHTF
-        table.cell(dash, 0, 2, "STATUS", text_color=color.white, bgcolor=color.new(color.red, 10))
-        table.cell(dash, 1, 2, "STOPPED", text_color=color.white, bgcolor=color.new(color.red, 10))
-        table.cell(dash, 0, 3, "Reason", text_color=color.gray)
-        table.cell(dash, 1, 3, "Chart TF >= HTF")
-        table.cell(dash, 0, 4, "Use", text_color=color.gray)
-        table.cell(dash, 1, 4, "Lower chart TF")
-    else
-        bullCount = 0
-        bearCount = 0
-        if array.size(zones) > 0
-            for i = 0 to array.size(zones) - 1
-                z = array.get(zones, i)
-                if z.dir == DIR_BULL
-                    bullCount += 1
-                else
-                    bearCount += 1
-        table.cell(dash, 0, 2, "Quality", text_color=color.gray)
-        table.cell(dash, 1, 2, quality)
-        table.cell(dash, 0, 3, "Liquidity Lookback", text_color=color.gray)
-        table.cell(dash, 1, 3, str.tostring(effLookback))
-        table.cell(dash, 0, 4, "Min Body", text_color=color.gray)
-        table.cell(dash, 1, 4, str.tostring(effMinBodyPct * 100, "#.0") + "%")
-        table.cell(dash, 0, 5, "Zones", text_color=color.gray)
-        table.cell(dash, 1, 5, "B " + str.tostring(bullCount) + " / S " + str.tostring(bearCount))
-        table.cell(dash, 0, 6, "Core Rules", text_color=color.gray)
-        table.cell(dash, 1, 6, "Sweep + Closeback")
-        table.cell(dash, 0, 7, "Min Conf Score", text_color=color.gray)
-        table.cell(dash, 1, 7, str.tostring(minConfirmScore) + " (0 = all)")
-        table.cell(dash, 0, 8, "Partial", text_color=color.gray)
-        table.cell(dash, 1, 8, showPartialMitigatedZones ? "Show remainder" : "Hide on touch")
-        table.cell(dash, 0, 9, "Min Sweep", text_color=color.gray)
-        table.cell(dash, 1, 9, str.tostring(minSweepTicks) + " tick(s)")
-        table.cell(dash, 0, 10, "Last Event", text_color=color.gray)
-        table.cell(dash, 1, 10, lastEvent)
-        table.cell(dash, 0, 11, "Debug Markers", text_color=color.gray)
-        table.cell(dash, 1, 11, showDebugMarkers ? "ON" : "OFF")
-        table.cell(dash, 0, 12, "Latest Liq Score", text_color=color.gray)
-        scoreDisp = na(lastZoneScore) ? "???" : str.tostring(math.round(lastZoneScore, 0))
-        table.cell(dash, 1, 12, scoreDisp, text_color=color.white, bgcolor=na(lastZoneScore) ? na : lastZoneScore >= 70 ? color.new(color.green, 40) : lastZoneScore >= 40 ? color.new(color.orange, 40) : color.new(color.red, 40))
+    table.cell(dash, 0, 2, "Anchor Mode", text_color=color.gray)
+    table.cell(dash, 1, 2, zoneAnchorMode)
+    table.cell(dash, 0, 3, "Pending", text_color=color.gray)
+    table.cell(dash, 1, 3, pendActive ? f_dirText(pendDir) + " DT " + f_dtPriceText(pendDt) : "None")
+    table.cell(dash, 0, 4, "Zones", text_color=color.gray)
+    table.cell(dash, 1, 4, str.tostring(array.size(zones)))
+    table.cell(dash, 0, 5, "HTF Events", text_color=color.gray)
+    table.cell(dash, 1, 5, str.tostring(htfEventsSeen))
+    table.cell(dash, 0, 6, "Last Event", text_color=color.gray)
+    table.cell(dash, 1, 6, lastEvent)
+    table.cell(dash, 0, 7, "Last HTF O/H/L/C", text_color=color.gray)
+    table.cell(dash, 1, 7, str.tostring(hOpen, format.mintick) + " / " + str.tostring(hHigh, format.mintick) + " / " + str.tostring(hLow, format.mintick) + " / " + str.tostring(hClose, format.mintick))
+    table.cell(dash, 0, 8, "Debug", text_color=color.gray)
+    table.cell(dash, 1, 8, (showDtDebug or showC2Debug) ? "ON " + str.tostring(array.size(dtDebugLabels)) : "OFF")
+    table.cell(dash, 0, 9, "Status", text_color=color.gray)
+    table.cell(dash, 1, 9, isLowerThanHTF ? "Running" : "Use chart TF < HTF")
 
 if barstate.islast and not showDashboard
-    table.clear(dash, 0, 0, 1, 12)
-
-
+    table.clear(dash, 0, 0, 1, 9)
